@@ -22,3 +22,4 @@ tracing-subscriber.workspace = true
 k8s-lsp-core = { path = "../k8s-lsp-core" }
 k8s-lsp-parser = { path = "../k8s-lsp-parser" }
 k8s-lsp-schema = { path = "../k8s-lsp-schema" }
+k8s-lsp-cluster = { path = "../k8s-lsp-cluster" }

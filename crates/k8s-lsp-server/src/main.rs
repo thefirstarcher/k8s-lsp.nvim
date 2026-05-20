@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use k8s_lsp_cluster::{ClusterRef, ClusterState};
 use k8s_lsp_core::{Document, DocumentStore, ResourceRef};
 use k8s_lsp_parser::{path_at, position_to_offset, DocumentPart, PathSeg};
 use k8s_lsp_schema::{
@@ -16,11 +17,24 @@ struct Backend {
     client: Client,
     store: Arc<DocumentStore>,
     schemas: Arc<SchemaRegistry>,
+    cluster: Arc<ClusterState>,
+    cluster_enabled: std::sync::atomic::AtomicBool,
 }
 
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
-    async fn initialize(&self, _params: InitializeParams) -> RpcResult<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> RpcResult<InitializeResult> {
+        let enabled = cluster_enabled_from(&params.initialization_options);
+        self.cluster_enabled
+            .store(enabled, std::sync::atomic::Ordering::SeqCst);
+        if enabled {
+            let cluster = self.cluster.clone();
+            tokio::spawn(async move {
+                if let Err(e) = cluster.refresh().await {
+                    tracing::warn!(error = %e, "initial cluster refresh failed");
+                }
+            });
+        }
         Ok(InitializeResult {
             server_info: Some(ServerInfo {
                 name: "k8s-lsp".to_string(),
@@ -36,7 +50,10 @@ impl LanguageServer for Backend {
                     ..Default::default()
                 }),
                 execute_command_provider: Some(ExecuteCommandOptions {
-                    commands: vec!["k8s-lsp.dumpSnapshot".to_string()],
+                    commands: vec![
+                        "k8s-lsp.dumpSnapshot".to_string(),
+                        "k8s-lsp.refreshCluster".to_string(),
+                    ],
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -83,15 +100,25 @@ impl LanguageServer for Backend {
         let rel_offset = abs_offset.saturating_sub(part.byte_range.start);
         let path = path_at(part_text, rel_offset);
 
-        // Value-position name-reference completion (cross-doc).
+        // Value-position name-reference completion (cross-doc + cluster).
         if line_is_value_position(&doc.text, pos.line, pos.character) {
             if let Some(target_kind) = ref_kind_for_path(&path) {
+                let mut items = Vec::new();
                 let refs = snap.refs_by_kind();
                 if let Some(list) = refs.get(target_kind) {
-                    let items = name_ref_items(list, part.namespace.as_deref(), &uri);
-                    if !items.is_empty() {
-                        return Ok(Some(CompletionResponse::Array(items)));
+                    items.extend(name_ref_items(list, part.namespace.as_deref(), &uri));
+                }
+                if self
+                    .cluster_enabled
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    let cluster_refs = self.cluster.snapshot().await;
+                    if let Some(list) = cluster_refs.get(target_kind) {
+                        items.extend(cluster_ref_items(list, part.namespace.as_deref()));
                     }
+                }
+                if !items.is_empty() {
+                    return Ok(Some(CompletionResponse::Array(items)));
                 }
             }
             return Ok(None);
@@ -155,6 +182,21 @@ impl LanguageServer for Backend {
     ) -> RpcResult<Option<serde_json::Value>> {
         match params.command.as_str() {
             "k8s-lsp.dumpSnapshot" => Ok(Some(dump_snapshot(&self.store))),
+            "k8s-lsp.refreshCluster" => {
+                if !self
+                    .cluster_enabled
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Ok(Some(json!({ "status": "disabled" })));
+                }
+                let cluster = self.cluster.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = cluster.refresh().await {
+                        tracing::warn!(error = %e, "manual cluster refresh failed");
+                    }
+                });
+                Ok(Some(json!({ "status": "refreshing" })))
+            }
             _ => Err(RpcError::method_not_found()),
         }
     }
@@ -268,6 +310,41 @@ fn ref_kind_for_path(path: &[PathSeg]) -> Option<&'static str> {
     }
 }
 
+/// Parse `initializationOptions = { "cluster": { "enabled": true } }`.
+fn cluster_enabled_from(opts: &Option<serde_json::Value>) -> bool {
+    opts.as_ref()
+        .and_then(|v| v.get("cluster"))
+        .and_then(|c| c.get("enabled"))
+        .and_then(|e| e.as_bool())
+        .unwrap_or(false)
+}
+
+fn cluster_ref_items(refs: &[ClusterRef], part_ns: Option<&str>) -> Vec<CompletionItem> {
+    refs.iter()
+        .filter(|r| match (part_ns, r.namespace.as_deref()) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        })
+        .map(|r| {
+            let detail = match &r.namespace {
+                Some(ns) => format!("cluster · namespace: {ns}"),
+                None => "cluster · cluster-scoped".to_string(),
+            };
+            CompletionItem {
+                label: r.name.clone(),
+                kind: Some(CompletionItemKind::REFERENCE),
+                detail: Some(detail),
+                documentation: Some(Documentation::MarkupContent(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: "From live cluster".to_string(),
+                })),
+                sort_text: Some(format!("2_{}", r.name)),
+                ..Default::default()
+            }
+        })
+        .collect()
+}
+
 fn name_ref_items(refs: &[ResourceRef], part_ns: Option<&str>, self_uri: &Url) -> Vec<CompletionItem> {
     refs.iter()
         .filter(|r| match (part_ns, r.namespace.as_deref()) {
@@ -359,10 +436,13 @@ async fn main() {
 
     let store = Arc::new(DocumentStore::new());
     let schemas = Arc::new(SchemaRegistry::new());
+    let cluster = Arc::new(ClusterState::new());
     let (service, socket) = LspService::new(|client| Backend {
         client,
         store: store.clone(),
         schemas: schemas.clone(),
+        cluster: cluster.clone(),
+        cluster_enabled: std::sync::atomic::AtomicBool::new(false),
     });
     Server::new(io::stdin(), io::stdout(), socket)
         .serve(service)
