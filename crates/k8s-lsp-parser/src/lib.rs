@@ -6,6 +6,8 @@
 
 use std::ops::Range;
 
+pub use k8s_lsp_schema::PathSeg;
+
 #[derive(Debug, Clone)]
 pub struct DocumentPart {
     pub byte_range: Range<usize>,
@@ -89,6 +91,100 @@ pub fn parse(text: &str) -> Vec<DocumentPart> {
     out
 }
 
+/// Convert an LSP `(line, character)` (UTF-8 byte index within the line, for now)
+/// to a byte offset within `text`.
+///
+/// LSP technically specifies UTF-16 code units for `character`; we accept that
+/// limitation in v0.1 since k8s manifests are overwhelmingly ASCII.
+pub fn position_to_offset(text: &str, line: u32, character: u32) -> usize {
+    let mut offset = 0usize;
+    for (i, line_text) in text.split_inclusive('\n').enumerate() {
+        if i as u32 == line {
+            let chars_in = (character as usize).min(line_text.trim_end_matches('\n').len());
+            return offset + chars_in;
+        }
+        offset += line_text.len();
+    }
+    text.len()
+}
+
+/// Walk a YAML document's text to determine the path to the node at `offset`.
+///
+/// Uses indentation/column heuristics — sufficient for hover/completion in v0.1.
+/// Returns the path from the document root down to (and including) the key on
+/// the target line. If the target line has no `key:`, returns the parent path.
+pub fn path_at(text: &str, offset: usize) -> Vec<PathSeg> {
+    let scan_end = line_end(text, offset);
+    let mut stack: Vec<(usize, PathSeg)> = Vec::new();
+    for line in text[..scan_end].split('\n') {
+        process_line(line, &mut stack);
+    }
+    stack.into_iter().map(|(_, s)| s).collect()
+}
+
+fn line_end(text: &str, offset: usize) -> usize {
+    let offset = offset.min(text.len());
+    text[offset..].find('\n').map(|n| offset + n).unwrap_or(text.len())
+}
+
+fn process_line(line: &str, stack: &mut Vec<(usize, PathSeg)>) {
+    let indent = line.bytes().take_while(|b| *b == b' ').count();
+    let rest = &line[indent..];
+    if rest.is_empty() || rest.starts_with('#') {
+        return;
+    }
+
+    let mut col = indent;
+    let mut s = rest;
+
+    let is_seq_marker = s == "-" || s.starts_with("- ") || s.starts_with("-\t");
+    if is_seq_marker {
+        pop_to(stack, col);
+        stack.push((col, PathSeg::Index));
+        if s == "-" {
+            return;
+        }
+        let after = &s[1..];
+        let ws = after.bytes().take_while(|b| *b == b' ' || *b == b'\t').count();
+        col += 1 + ws;
+        s = &after[ws..];
+        if s.is_empty() || s.starts_with('#') {
+            return;
+        }
+    }
+
+    if let Some(key) = parse_key(s) {
+        pop_to(stack, col);
+        stack.push((col, PathSeg::Key(key)));
+    }
+}
+
+fn pop_to(stack: &mut Vec<(usize, PathSeg)>, col: usize) {
+    while stack.last().map_or(false, |(c, _)| *c >= col) {
+        stack.pop();
+    }
+}
+
+fn parse_key(s: &str) -> Option<String> {
+    let end = s
+        .bytes()
+        .position(|b| !(b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.'))
+        .unwrap_or(s.len());
+    if end == 0 {
+        return None;
+    }
+    let rest = &s[end..];
+    if !rest.starts_with(':') {
+        return None;
+    }
+    let after_colon = &rest[1..];
+    if after_colon.is_empty() || matches!(after_colon.as_bytes()[0], b' ' | b'\t' | b'\n' | b'\r') {
+        Some(s[..end].to_string())
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,5 +233,64 @@ mod tests {
         let text = "kind: Pod\nmetadata:\n  name: p\n  namespace: ns1\n";
         let parts = parse(text);
         assert_eq!(parts[0].namespace.as_deref(), Some("ns1"));
+    }
+
+    #[test]
+    fn path_at_top_level_key() {
+        let text = "apiVersion: apps/v1\nkind: Deployment\n";
+        let off = position_to_offset(text, 1, 0); // on "kind:"
+        let path = path_at(text, off);
+        assert_eq!(path, vec![PathSeg::Key("kind".into())]);
+    }
+
+    #[test]
+    fn path_at_nested_mapping() {
+        let text = "spec:\n  replicas: 3\n";
+        let off = position_to_offset(text, 1, 2); // on "replicas"
+        let path = path_at(text, off);
+        assert_eq!(
+            path,
+            vec![PathSeg::Key("spec".into()), PathSeg::Key("replicas".into())]
+        );
+    }
+
+    #[test]
+    fn path_at_sequence_item_field() {
+        let text = "spec:\n  containers:\n    - name: foo\n      image: bar\n";
+        let off = position_to_offset(text, 3, 6); // on "image"
+        let path = path_at(text, off);
+        assert_eq!(
+            path,
+            vec![
+                PathSeg::Key("spec".into()),
+                PathSeg::Key("containers".into()),
+                PathSeg::Index,
+                PathSeg::Key("image".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn path_at_second_sequence_item() {
+        let text = "spec:\n  containers:\n    - name: foo\n    - name: bar\n";
+        let off = position_to_offset(text, 3, 6); // on second "name"
+        let path = path_at(text, off);
+        assert_eq!(
+            path,
+            vec![
+                PathSeg::Key("spec".into()),
+                PathSeg::Key("containers".into()),
+                PathSeg::Index,
+                PathSeg::Key("name".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn path_at_partial_line_returns_parent() {
+        let text = "spec:\n  repl"; // user typing
+        let off = text.len();
+        let path = path_at(text, off);
+        assert_eq!(path, vec![PathSeg::Key("spec".into())]);
     }
 }

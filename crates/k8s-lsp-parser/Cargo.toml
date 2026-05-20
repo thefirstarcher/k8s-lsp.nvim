@@ -10,3 +10,4 @@ publish = false
 anyhow.workspace = true
 serde_yaml.workspace = true
 tracing.workspace = true
+k8s-lsp-schema = { path = "../k8s-lsp-schema" }

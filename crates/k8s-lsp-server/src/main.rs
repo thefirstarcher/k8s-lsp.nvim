@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
 use k8s_lsp_core::DocumentStore;
+use k8s_lsp_parser::{path_at, position_to_offset};
+use k8s_lsp_schema::{render_hover, schema_at_path, SchemaRegistry};
 use serde_json::json;
 use tokio::io;
 use tower_lsp::jsonrpc::{Error as RpcError, Result as RpcResult};
@@ -11,6 +13,7 @@ use tracing_subscriber::EnvFilter;
 struct Backend {
     client: Client,
     store: Arc<DocumentStore>,
+    schemas: Arc<SchemaRegistry>,
 }
 
 #[tower_lsp::async_trait]
@@ -64,6 +67,51 @@ impl LanguageServer for Backend {
         self.store.remove(&params.text_document.uri);
     }
 
+    async fn hover(&self, params: HoverParams) -> RpcResult<Option<Hover>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        let snap = self.store.snapshot();
+        let Some(doc) = snap.documents.get(&uri) else { return Ok(None) };
+
+        let abs_offset = position_to_offset(&doc.text, pos.line, pos.character);
+        let Some(part) = doc
+            .parts
+            .iter()
+            .find(|p| abs_offset >= p.byte_range.start && abs_offset <= p.byte_range.end)
+        else {
+            return Ok(None);
+        };
+        let (Some(av), Some(kind)) = (part.api_version.as_deref(), part.kind.as_deref()) else {
+            return Ok(None);
+        };
+        let Some(schema) = self.schemas.lookup(av, kind) else { return Ok(None) };
+
+        let part_text = &doc.text[part.byte_range.clone()];
+        let rel_offset = abs_offset.saturating_sub(part.byte_range.start);
+        let path = path_at(part_text, rel_offset);
+        if path.is_empty() {
+            return Ok(None);
+        }
+        let Some(node) = schema_at_path(&schema, &path) else { return Ok(None) };
+
+        let qualified = std::iter::once(kind.to_string())
+            .chain(path.iter().map(|seg| match seg {
+                k8s_lsp_parser::PathSeg::Key(k) => k.clone(),
+                k8s_lsp_parser::PathSeg::Index => "[]".to_string(),
+            }))
+            .collect::<Vec<_>>()
+            .join(".");
+        let md = render_hover(&qualified, node);
+
+        Ok(Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: md,
+            }),
+            range: None,
+        }))
+    }
+
     async fn execute_command(
         &self,
         params: ExecuteCommandParams,
@@ -114,9 +162,11 @@ async fn main() {
         .init();
 
     let store = Arc::new(DocumentStore::new());
+    let schemas = Arc::new(SchemaRegistry::new());
     let (service, socket) = LspService::new(|client| Backend {
         client,
         store: store.clone(),
+        schemas: schemas.clone(),
     });
     Server::new(io::stdin(), io::stdout(), socket)
         .serve(service)
