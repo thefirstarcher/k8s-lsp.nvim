@@ -10,6 +10,6 @@ pub mod walk;
 
 pub use completion::{fields_at, FieldCandidate};
 pub use hover::{is_secret_field, render_hover};
-pub use registry::SchemaRegistry;
+pub use registry::{object_meta, SchemaRegistry};
 pub use validate::{validate, Issue, Severity};
 pub use walk::{schema_at_path, PathSeg};

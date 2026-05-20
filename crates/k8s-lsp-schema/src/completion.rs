@@ -2,7 +2,7 @@
 
 use serde_json::Value;
 
-use crate::walk::{schema_at_path, PathSeg};
+use crate::walk::{resolve_ref, schema_at_path, PathSeg};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldCandidate {
@@ -20,15 +20,17 @@ pub fn fields_at(root: &Value, path: &[PathSeg]) -> Vec<FieldCandidate> {
     let Some(node) = schema_at_path(root, path) else { return Vec::new() };
     let required = required_set(node);
     let mut out = Vec::new();
-    collect_properties(node, &required, &mut out);
+    collect_properties(root, node, &required, &mut out);
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out.dedup_by(|a, b| a.name == b.name);
     out
 }
 
-fn collect_properties(node: &Value, required: &[String], out: &mut Vec<FieldCandidate>) {
+fn collect_properties(root: &Value, node: &Value, required: &[String], out: &mut Vec<FieldCandidate>) {
+    let node = resolve_ref(root, node);
     if let Some(obj) = node.get("properties").and_then(|v| v.as_object()) {
         for (name, child) in obj {
+            let child = resolve_ref(root, child);
             out.push(FieldCandidate {
                 name: name.clone(),
                 type_label: type_label(child),
@@ -43,7 +45,7 @@ fn collect_properties(node: &Value, required: &[String], out: &mut Vec<FieldCand
     for key in ["allOf", "oneOf", "anyOf"] {
         if let Some(arr) = node.get(key).and_then(|v| v.as_array()) {
             for child in arr {
-                collect_properties(child, required, out);
+                collect_properties(root, child, required, out);
             }
         }
     }

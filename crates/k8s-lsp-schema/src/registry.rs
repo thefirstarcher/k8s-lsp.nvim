@@ -16,11 +16,34 @@ const BUNDLE: &[(&str, &str, &str)] = &[
     ("apps/v1", "StatefulSet", include_str!("../../../assets/schemas/statefulset-apps-v1.json")),
     ("batch/v1", "CronJob", include_str!("../../../assets/schemas/cronjob-batch-v1.json")),
     ("batch/v1", "Job", include_str!("../../../assets/schemas/job-batch-v1.json")),
+    (
+        "kustomize.config.k8s.io/v1beta1",
+        "Kustomization",
+        include_str!("../../../assets/schemas/kustomization-v1beta1.json"),
+    ),
 ];
+
+/// Embedded ObjectMeta JSON schema. Used as a fallback for hover/completion
+/// on `metadata.*` paths when a CRD's schema declares `metadata` as an
+/// opaque object (typical: `properties.metadata: { type: object }`).
+const OBJECT_META: &str = include_str!("../../../assets/schemas/objectmeta-v1.json");
+
+static OBJECT_META_CACHE: std::sync::OnceLock<Arc<Value>> = std::sync::OnceLock::new();
+
+pub fn object_meta() -> Arc<Value> {
+    OBJECT_META_CACHE
+        .get_or_init(|| {
+            let v: Value = serde_json::from_str(OBJECT_META)
+                .expect("embedded ObjectMeta schema must parse");
+            Arc::new(v)
+        })
+        .clone()
+}
 
 #[derive(Default)]
 pub struct SchemaRegistry {
     cache: Mutex<HashMap<(String, String), Arc<Value>>>,
+    dynamic: Mutex<HashMap<(String, String), Arc<Value>>>,
 }
 
 impl SchemaRegistry {
@@ -50,12 +73,30 @@ impl SchemaRegistry {
                 return Some(arc);
             }
         }
-        None
+        let g = self.dynamic.lock().unwrap();
+        g.get(&key).cloned()
     }
 
     /// True if the registry has a schema for this resource.
     pub fn has(&self, api_version: &str, kind: &str) -> bool {
-        BUNDLE.iter().any(|(av, k, _)| *av == api_version && *k == kind)
+        if BUNDLE.iter().any(|(av, k, _)| *av == api_version && *k == kind) {
+            return true;
+        }
+        let key = (api_version.to_string(), kind.to_string());
+        self.dynamic.lock().unwrap().contains_key(&key)
+    }
+
+    /// Insert a schema discovered at runtime (e.g. CRD from live cluster or
+    /// offline file). Replaces any previous dynamic entry for (apiVersion, kind).
+    /// Built-in BUNDLE entries always win over dynamic.
+    pub fn insert_dynamic(&self, api_version: String, kind: String, schema: Value) {
+        let key = (api_version, kind);
+        self.dynamic.lock().unwrap().insert(key, Arc::new(schema));
+    }
+
+    /// Count of dynamic schemas currently registered (for diagnostics/logging).
+    pub fn dynamic_len(&self) -> usize {
+        self.dynamic.lock().unwrap().len()
     }
 }
 

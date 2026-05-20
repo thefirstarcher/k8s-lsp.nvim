@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
-use k8s_lsp_cluster::{ClusterRef, ClusterState};
+use k8s_lsp_cluster::{list_crds, load_crds_from_paths, ClusterRef, ClusterState};
 use k8s_lsp_core::{Document, DocumentStore, ResourceRef};
 use k8s_lsp_parser::{path_at, position_to_offset, DocumentPart, PathSeg};
 use k8s_lsp_schema::{
-    fields_at, render_hover, schema_at_path, validate, FieldCandidate, SchemaRegistry, Severity,
+    fields_at, object_meta, render_hover, schema_at_path, validate, FieldCandidate,
+    SchemaRegistry, Severity,
 };
 use serde_json::json;
 use tokio::io;
@@ -38,6 +39,21 @@ impl LanguageServer for Backend {
             tokio::spawn(async move {
                 if let Err(e) = cluster.refresh().await {
                     tracing::warn!(error = %e, "initial cluster refresh failed");
+                }
+            });
+            let schemas = self.schemas.clone();
+            tokio::spawn(async move {
+                for c in list_crds().await {
+                    schemas.insert_dynamic(c.api_version, c.kind, c.schema);
+                }
+            });
+        }
+        let crd_paths = crd_paths_from(&params.initialization_options);
+        if !crd_paths.is_empty() {
+            let schemas = self.schemas.clone();
+            tokio::task::spawn_blocking(move || {
+                for c in load_crds_from_paths(&crd_paths) {
+                    schemas.insert_dynamic(c.api_version, c.kind, c.schema);
                 }
             });
         }
@@ -145,7 +161,11 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
         let Some(schema) = self.schemas.lookup(av, kind) else { return Ok(None) };
-        let candidates = fields_at(&schema, &path);
+        let mut candidates = fields_at(&schema, &path);
+        if candidates.is_empty() && is_metadata_path(&path) {
+            let meta = object_meta();
+            candidates = fields_at(&meta, &path[1..]);
+        }
         if candidates.is_empty() {
             return Ok(None);
         }
@@ -172,7 +192,15 @@ impl LanguageServer for Backend {
         if path.is_empty() {
             return Ok(None);
         }
-        let Some(node) = schema_at_path(&schema, &path) else { return Ok(None) };
+        let meta = object_meta();
+        let node = schema_at_path(&schema, &path).or_else(|| {
+            if is_metadata_path(&path) {
+                schema_at_path(&meta, &path[1..])
+            } else {
+                None
+            }
+        });
+        let Some(node) = node else { return Ok(None) };
 
         let qualified = std::iter::once(kind.to_string())
             .chain(path.iter().map(|seg| match seg {
@@ -276,6 +304,12 @@ fn part_at(doc: &Document, abs_offset: usize) -> Option<&DocumentPart> {
         .find(|p| abs_offset >= p.byte_range.start && abs_offset <= p.byte_range.end)
 }
 
+/// True when `path` descends into `metadata.*`. Used to fall back to the
+/// embedded ObjectMeta schema for CRDs that declare `metadata` as opaque.
+fn is_metadata_path(path: &[PathSeg]) -> bool {
+    matches!(path.first(), Some(PathSeg::Key(k)) if k == "metadata") && path.len() > 1
+}
+
 fn field_to_item(c: FieldCandidate) -> CompletionItem {
     let mut item = CompletionItem {
         label: c.name.clone(),
@@ -351,6 +385,29 @@ fn cluster_enabled_from(opts: &Option<serde_json::Value>) -> bool {
         .and_then(|c| c.get("enabled"))
         .and_then(|e| e.as_bool())
         .unwrap_or(false)
+}
+
+/// Parse `initializationOptions = { "crdSchemaPaths": ["~/x.yaml", ...] }`.
+/// Expands a leading `~` against $HOME. Non-string entries are dropped.
+fn crd_paths_from(opts: &Option<serde_json::Value>) -> Vec<std::path::PathBuf> {
+    let Some(arr) = opts
+        .as_ref()
+        .and_then(|v| v.get("crdSchemaPaths"))
+        .and_then(|v| v.as_array())
+    else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|v| v.as_str())
+        .map(|s| {
+            if let Some(rest) = s.strip_prefix("~/") {
+                if let Ok(home) = std::env::var("HOME") {
+                    return std::path::PathBuf::from(home).join(rest);
+                }
+            }
+            std::path::PathBuf::from(s)
+        })
+        .collect()
 }
 
 fn cluster_ref_items(refs: &[ClusterRef], part_ns: Option<&str>) -> Vec<CompletionItem> {

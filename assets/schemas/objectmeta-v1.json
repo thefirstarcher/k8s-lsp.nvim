@@ -1,0 +1,48 @@
+{
+  "description": "ObjectMeta is metadata that all persisted resources must have, which includes all objects users must create.",
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Name must be unique within a namespace. Is required when creating resources, although some resources may allow a client to request the generation of an appropriate name automatically. Name is primarily intended for creation idempotence and configuration definition. Cannot be updated. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names#names"
+    },
+    "generateName": {
+      "type": "string",
+      "description": "GenerateName is an optional prefix, used by the server, to generate a unique name ONLY IF the Name field has not been provided. If this field is used, the name returned to the client will be different than the name passed. This value will also be combined with a unique suffix."
+    },
+    "namespace": {
+      "type": "string",
+      "description": "Namespace defines the space within which each name must be unique. An empty namespace is equivalent to the \"default\" namespace, but \"default\" is the canonical representation. Not all objects are required to be scoped to a namespace - the value of this field for those objects will be empty. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/namespaces"
+    },
+    "labels": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "Map of string keys and values that can be used to organize and categorize (scope and select) objects. May match selectors of replication controllers and services. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/labels"
+    },
+    "annotations": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "Annotations is an unstructured key value map stored with a resource that may be set by external tools to store and retrieve arbitrary metadata. They are not queryable and should be preserved when modifying objects. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/annotations"
+    },
+    "finalizers": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Must be empty before the object is deleted from the registry. Each entry is an identifier for the responsible component that will remove the entry from the list. If the deletionTimestamp of the object is non-nil, entries in this list can only be removed. Finalizers may be processed and removed in any order."
+    },
+    "ownerReferences": {
+      "type": "array",
+      "description": "List of objects depended by this object. If ALL objects in the list have been deleted, this object will be garbage collected.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "apiVersion": { "type": "string", "description": "API version of the referent." },
+          "kind": { "type": "string", "description": "Kind of the referent." },
+          "name": { "type": "string", "description": "Name of the referent." },
+          "uid": { "type": "string", "description": "UID of the referent." },
+          "controller": { "type": "boolean", "description": "If true, this reference points to the managing controller." },
+          "blockOwnerDeletion": { "type": "boolean", "description": "If true, AND if the owner has the \"foregroundDeletion\" finalizer, then the owner cannot be deleted from the key-value store until this reference is removed." }
+        }
+      }
+    }
+  }
+}

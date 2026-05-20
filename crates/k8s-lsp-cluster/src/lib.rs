@@ -13,9 +13,23 @@ use anyhow::Result;
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, PersistentVolumeClaim, Secret, ServiceAccount};
 use k8s_openapi::api::scheduling::v1::PriorityClass;
 use k8s_openapi::api::storage::v1::StorageClass;
+use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 use kube::api::{Api, ListParams, ObjectList, ResourceExt};
 use kube::Client;
+use serde::Deserialize;
+use serde_json::Value;
 use tokio::sync::RwLock;
+
+/// A schema discovered at runtime (live CRD or offline file).
+#[derive(Debug, Clone)]
+pub struct CrdSchema {
+    /// "group/version" — e.g. "postgresql.cnpg.io/v1".
+    pub api_version: String,
+    pub kind: String,
+    /// JSON-schema body matching the shape of bundled schemas: an object with
+    /// `properties.spec` etc. Sourced from `spec.versions[i].schema.openAPIV3Schema`.
+    pub schema: Value,
+}
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -150,5 +164,120 @@ where
         .await
         .map_err(|_| anyhow::anyhow!("list timed out"))??;
     Ok(list.items)
+}
+
+/// List every CRD in the bound cluster and flatten to one entry per
+/// (group/version, kind). Soft-fails like the rest of this module: any
+/// failure returns an empty Vec so the server keeps serving built-in
+/// schemas.
+pub async fn list_crds() -> Vec<CrdSchema> {
+    let client = match tokio::time::timeout(REQUEST_TIMEOUT, Client::try_default()).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "CRD fetch: kube client init failed");
+            return Vec::new();
+        }
+        Err(_) => {
+            tracing::warn!("CRD fetch: kube client init timed out");
+            return Vec::new();
+        }
+    };
+
+    let api: Api<CustomResourceDefinition> = Api::all(client);
+    let items = match timed_list(api.list(&ListParams::default())).await {
+        Ok(list) => list,
+        Err(e) => {
+            tracing::warn!(error = %e, "CRD list failed");
+            return Vec::new();
+        }
+    };
+
+    let mut out = Vec::new();
+    for crd in items {
+        let group = crd.spec.group.clone();
+        let kind = crd.spec.names.kind.clone();
+        for v in crd.spec.versions {
+            let Some(validation) = v.schema else { continue };
+            let Some(schema) = validation.open_api_v3_schema else { continue };
+            let api_version = if group.is_empty() {
+                v.name.clone()
+            } else {
+                format!("{group}/{}", v.name)
+            };
+            // serde_json::Value via re-serialize.
+            let raw = match serde_json::to_value(&schema) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(api_version, kind, error = %e, "CRD schema serialize failed");
+                    continue;
+                }
+            };
+            out.push(CrdSchema {
+                api_version,
+                kind: kind.clone(),
+                schema: raw,
+            });
+        }
+    }
+    tracing::info!(count = out.len(), "CRD schemas loaded from cluster");
+    out
+}
+
+/// Load CRD schemas from local YAML/JSON files. Each file may contain one or
+/// more CustomResourceDefinition documents (YAML `---`-separated). Bad files
+/// are logged and skipped; one broken file never poisons the rest.
+pub fn load_crds_from_paths<P: AsRef<std::path::Path>>(paths: &[P]) -> Vec<CrdSchema> {
+    let mut out = Vec::new();
+    for p in paths {
+        let path = p.as_ref();
+        let text = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "CRD file read failed");
+                continue;
+            }
+        };
+        for doc in serde_yaml::Deserializer::from_str(&text) {
+            let val: Value = match Value::deserialize(doc) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "CRD yaml parse failed");
+                    continue;
+                }
+            };
+            let crd: CustomResourceDefinition = match serde_json::from_value(val) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "CRD shape mismatch");
+                    continue;
+                }
+            };
+            let group = crd.spec.group.clone();
+            let kind = crd.spec.names.kind.clone();
+            for v in crd.spec.versions {
+                let Some(validation) = v.schema else { continue };
+                let Some(schema) = validation.open_api_v3_schema else { continue };
+                let api_version = if group.is_empty() {
+                    v.name.clone()
+                } else {
+                    format!("{group}/{}", v.name)
+                };
+                let raw = match serde_json::to_value(&schema) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(api_version, kind, error = %e, "CRD schema serialize failed");
+                        continue;
+                    }
+                };
+                out.push(CrdSchema {
+                    api_version,
+                    kind: kind.clone(),
+                    schema: raw,
+                });
+            }
+        }
+    }
+    tracing::info!(count = out.len(), "CRD schemas loaded from files");
+    out
 }
 

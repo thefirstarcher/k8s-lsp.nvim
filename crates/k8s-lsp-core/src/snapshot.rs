@@ -21,8 +21,27 @@ pub struct Document {
 
 impl Document {
     pub fn new(uri: Url, version: i32, text: String) -> Self {
-        let parts = parse(&text);
+        let mut parts = parse(&text);
+        apply_kustomization_fallback(&uri, &mut parts);
         Self { uri, version, text, parts }
+    }
+}
+
+/// Kustomization files conventionally omit `apiVersion`/`kind`. Detect by
+/// filename and inject the canonical identity so schema lookup works.
+fn apply_kustomization_fallback(uri: &Url, parts: &mut [DocumentPart]) {
+    let Some(seg) = uri.path_segments().and_then(|s| s.last()) else { return };
+    let name = seg.to_ascii_lowercase();
+    let is_kustomization = matches!(
+        name.as_str(),
+        "kustomization.yaml" | "kustomization.yml" | "kustomization"
+    );
+    if !is_kustomization { return; }
+    if parts.len() != 1 { return; }
+    let part = &mut parts[0];
+    if part.api_version.is_none() && part.kind.is_none() {
+        part.api_version = Some("kustomize.config.k8s.io/v1beta1".into());
+        part.kind = Some("Kustomization".into());
     }
 }
 
