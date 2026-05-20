@@ -69,26 +69,86 @@ fn as_str<'a>(v: &'a serde_yaml::Value, key: &str) -> Option<&'a str> {
 }
 
 /// Parse a YAML stream into one `DocumentPart` per document.
-/// Documents that fail to parse are skipped (mid-typing tolerance).
+/// Documents that fail to parse fall back to a line-based identity scan so
+/// completion/hover still work mid-typing.
 pub fn parse(text: &str) -> Vec<DocumentPart> {
     let mut out = Vec::new();
     for range in split_documents(text) {
         let chunk = &text[range.clone()];
-        let value: serde_yaml::Value = match serde_yaml::from_str(chunk) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let metadata = value.get("metadata");
-        out.push(DocumentPart {
-            byte_range: range,
-            api_version: as_str(&value, "apiVersion").map(str::to_string),
-            kind: as_str(&value, "kind").map(str::to_string),
-            name: metadata.and_then(|m| as_str(m, "name").map(str::to_string)),
-            namespace: metadata.and_then(|m| as_str(m, "namespace").map(str::to_string)),
-            value,
-        });
+        match serde_yaml::from_str::<serde_yaml::Value>(chunk) {
+            Ok(value) => {
+                let metadata = value.get("metadata");
+                out.push(DocumentPart {
+                    byte_range: range,
+                    api_version: as_str(&value, "apiVersion").map(str::to_string),
+                    kind: as_str(&value, "kind").map(str::to_string),
+                    name: metadata.and_then(|m| as_str(m, "name").map(str::to_string)),
+                    namespace: metadata.and_then(|m| as_str(m, "namespace").map(str::to_string)),
+                    value,
+                });
+            }
+            Err(_) => {
+                let (api_version, kind, name, namespace) = scan_identity(chunk);
+                if api_version.is_none() && kind.is_none() {
+                    continue;
+                }
+                out.push(DocumentPart {
+                    byte_range: range,
+                    api_version,
+                    kind,
+                    name,
+                    namespace,
+                    value: serde_yaml::Value::Null,
+                });
+            }
+        }
     }
     out
+}
+
+/// Best-effort line-based scan for `apiVersion`, `kind`, and `metadata.{name,namespace}`.
+/// Used when the chunk is unparseable mid-typing.
+fn scan_identity(chunk: &str) -> (Option<String>, Option<String>, Option<String>, Option<String>) {
+    let mut api_version = None;
+    let mut kind = None;
+    let mut name = None;
+    let mut namespace = None;
+    let mut in_metadata = false;
+    for line in chunk.split('\n') {
+        let indent = line.bytes().take_while(|b| *b == b' ').count();
+        let rest = &line[indent..];
+        if rest.is_empty() || rest.starts_with('#') {
+            continue;
+        }
+        if indent == 0 {
+            in_metadata = false;
+            if let Some(v) = strip_kv(rest, "apiVersion") {
+                api_version = Some(v);
+            } else if let Some(v) = strip_kv(rest, "kind") {
+                kind = Some(v);
+            } else if rest.starts_with("metadata:") {
+                in_metadata = true;
+            }
+        } else if in_metadata && indent >= 2 {
+            if let Some(v) = strip_kv(rest, "name") {
+                name = Some(v);
+            } else if let Some(v) = strip_kv(rest, "namespace") {
+                namespace = Some(v);
+            }
+        }
+    }
+    (api_version, kind, name, namespace)
+}
+
+fn strip_kv(line: &str, key: &str) -> Option<String> {
+    let rest = line.strip_prefix(key)?.strip_prefix(':')?;
+    let trimmed = rest.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+    let val = trimmed.split('#').next()?.trim();
+    let val = val.trim_matches('"').trim_matches('\'');
+    if val.is_empty() { None } else { Some(val.to_string()) }
 }
 
 /// Convert an LSP `(line, character)` (UTF-8 byte index within the line, for now)
@@ -113,11 +173,23 @@ pub fn position_to_offset(text: &str, line: u32, character: u32) -> usize {
 /// Uses indentation/column heuristics — sufficient for hover/completion in v0.1.
 /// Returns the path from the document root down to (and including) the key on
 /// the target line. If the target line has no `key:`, returns the parent path.
+///
+/// On the cursor's own line we first pop the stack to the cursor's intended
+/// indent (`min(cursor column, leading non-space column)`) before processing
+/// it. This stops stale sibling keys from upper lines from polluting the path
+/// when the user is on a blank or partially-typed line.
 pub fn path_at(text: &str, offset: usize) -> Vec<PathSeg> {
     let scan_end = line_end(text, offset);
+    let cursor_line_start = line_start(text, offset);
+    let cursor_col = offset.min(text.len()).saturating_sub(cursor_line_start);
     let mut stack: Vec<(usize, PathSeg)> = Vec::new();
+    let mut pos = 0usize;
     for line in text[..scan_end].split('\n') {
+        if pos == cursor_line_start {
+            pop_to(&mut stack, intended_indent(line, cursor_col));
+        }
         process_line(line, &mut stack);
+        pos += line.len() + 1;
     }
     stack.into_iter().map(|(_, s)| s).collect()
 }
@@ -125,6 +197,19 @@ pub fn path_at(text: &str, offset: usize) -> Vec<PathSeg> {
 fn line_end(text: &str, offset: usize) -> usize {
     let offset = offset.min(text.len());
     text[offset..].find('\n').map(|n| offset + n).unwrap_or(text.len())
+}
+
+fn line_start(text: &str, offset: usize) -> usize {
+    let offset = offset.min(text.len());
+    text[..offset].rfind('\n').map(|n| n + 1).unwrap_or(0)
+}
+
+fn intended_indent(line: &str, cursor_col: usize) -> usize {
+    let first_nonspace = line
+        .bytes()
+        .position(|b| b != b' ')
+        .unwrap_or(usize::MAX);
+    first_nonspace.min(cursor_col)
 }
 
 fn process_line(line: &str, stack: &mut Vec<(usize, PathSeg)>) {
