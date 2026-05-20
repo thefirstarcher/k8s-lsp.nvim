@@ -1,0 +1,12 @@
+[package]
+name = "k8s-lsp-parser"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+serde_yaml.workspace = true
+tracing.workspace = true
