@@ -13,6 +13,12 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 use tracing_subscriber::EnvFilter;
 
+/// Reject any single document larger than this. Tree-sitter and the JSON
+/// Schema validator both have super-linear worst cases on pathological input;
+/// 10 MiB is far above any sane manifest size while keeping cold-path work
+/// bounded.
+const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
+
 struct Backend {
     client: Client,
     store: Arc<DocumentStore>,
@@ -69,6 +75,11 @@ impl LanguageServer for Backend {
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let doc = params.text_document;
+        if doc.text.len() > MAX_FILE_BYTES {
+            self.store.remove(&doc.uri);
+            self.publish_oversize(doc.uri, Some(doc.version), doc.text.len()).await;
+            return;
+        }
         self.store.upsert(doc.uri.clone(), doc.version, doc.text);
         self.publish_diagnostics(doc.uri, Some(doc.version)).await;
     }
@@ -78,6 +89,11 @@ impl LanguageServer for Backend {
         let Some(change) = params.content_changes.into_iter().next() else { return };
         let uri = params.text_document.uri;
         let version = params.text_document.version;
+        if change.text.len() > MAX_FILE_BYTES {
+            self.store.remove(&uri);
+            self.publish_oversize(uri, Some(version), change.text.len()).await;
+            return;
+        }
         self.store.upsert(uri.clone(), version, change.text);
         self.publish_diagnostics(uri, Some(version)).await;
     }
@@ -207,6 +223,24 @@ impl LanguageServer for Backend {
 }
 
 impl Backend {
+    async fn publish_oversize(&self, uri: Url, version: Option<i32>, size: usize) {
+        let mib = size as f64 / (1024.0 * 1024.0);
+        let limit = MAX_FILE_BYTES / (1024 * 1024);
+        let diag = Diagnostic {
+            range: Range {
+                start: Position { line: 0, character: 0 },
+                end: Position { line: 0, character: 0 },
+            },
+            severity: Some(DiagnosticSeverity::ERROR),
+            source: Some("k8s-lsp".into()),
+            message: format!(
+                "file is {mib:.2} MiB; k8s-lsp skips files larger than {limit} MiB"
+            ),
+            ..Default::default()
+        };
+        self.client.publish_diagnostics(uri, vec![diag], version).await;
+    }
+
     async fn publish_diagnostics(&self, uri: Url, version: Option<i32>) {
         let snap = self.store.snapshot();
         let Some(doc) = snap.documents.get(&uri) else { return };

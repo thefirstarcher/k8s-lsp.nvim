@@ -8,6 +8,9 @@ pub fn render_hover(qualified_name: &str, schema: &Value) -> String {
     out.push_str(qualified_name);
     out.push_str("**\n\n");
 
+    let leaf = qualified_name.rsplit('.').next().unwrap_or(qualified_name);
+    let secret = is_secret_field(leaf);
+
     let ty = type_label(schema);
     let format = schema.get("format").and_then(|v| v.as_str());
     let default = schema.get("default");
@@ -23,7 +26,11 @@ pub fn render_hover(qualified_name: &str, schema: &Value) -> String {
         out.push_str(" · **required**");
     }
     if let Some(d) = default {
-        out.push_str(&format!(" · default: `{}`", serde_json::to_string(d).unwrap_or_default()));
+        if secret {
+            out.push_str(" · default: `<redacted>`");
+        } else {
+            out.push_str(&format!(" · default: `{}`", serde_json::to_string(d).unwrap_or_default()));
+        }
     }
     out.push_str("\n\n");
 
@@ -68,6 +75,19 @@ fn is_required(_schema: &Value) -> bool {
     false
 }
 
+/// Heuristic match for field names that conventionally hold credentials.
+/// Matches case-insensitively against `password`, `token`, `secret`, and
+/// `apiKey` / `api_key` / `api-key`.
+pub fn is_secret_field(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    if n.contains("password") || n.contains("token") || n.contains("secret") {
+        return true;
+    }
+    // api_key / api-key / apikey
+    let stripped: String = n.chars().filter(|c| *c != '_' && *c != '-').collect();
+    stripped.contains("apikey")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,6 +107,27 @@ mod tests {
         assert!(md.contains("format: `int32`"));
         assert!(md.contains("default: `1`"));
         assert!(md.contains("Number of desired pods."));
+    }
+
+    #[test]
+    fn redacts_default_for_secret_fields() {
+        let s = json!({ "type": "string", "default": "hunter2" });
+        let md = render_hover("Backend.spec.password", &s);
+        assert!(md.contains("`<redacted>`"));
+        assert!(!md.contains("hunter2"));
+    }
+
+    #[test]
+    fn secret_field_matcher() {
+        assert!(is_secret_field("password"));
+        assert!(is_secret_field("dbPassword"));
+        assert!(is_secret_field("apiKey"));
+        assert!(is_secret_field("api_key"));
+        assert!(is_secret_field("api-key"));
+        assert!(is_secret_field("authToken"));
+        assert!(is_secret_field("clientSecret"));
+        assert!(!is_secret_field("name"));
+        assert!(!is_secret_field("replicas"));
     }
 
     #[test]

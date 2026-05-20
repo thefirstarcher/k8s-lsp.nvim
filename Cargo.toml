@@ -7,6 +7,9 @@ members = [
     "crates/k8s-lsp-schema",
     "crates/k8s-lsp-cluster",
 ]
+# `fuzz/` is a separate cargo-fuzz crate (requires nightly + libFuzzer) and
+# must stay out of the default workspace build.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"

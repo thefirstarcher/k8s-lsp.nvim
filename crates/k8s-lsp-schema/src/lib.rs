@@ -9,7 +9,7 @@ pub mod validate;
 pub mod walk;
 
 pub use completion::{fields_at, FieldCandidate};
-pub use hover::render_hover;
+pub use hover::{is_secret_field, render_hover};
 pub use registry::SchemaRegistry;
 pub use validate::{validate, Issue, Severity};
 pub use walk::{schema_at_path, PathSeg};
