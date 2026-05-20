@@ -19,3 +19,5 @@ tokio-util.workspace = true
 tower-lsp.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+k8s-lsp-core = { path = "../k8s-lsp-core" }
+k8s-lsp-parser = { path = "../k8s-lsp-parser" }
