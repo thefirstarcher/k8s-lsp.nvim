@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use k8s_lsp_core::{Document, DocumentStore};
-use k8s_lsp_parser::{path_at, position_to_offset, DocumentPart};
+use k8s_lsp_core::{Document, DocumentStore, ResourceRef};
+use k8s_lsp_parser::{path_at, position_to_offset, DocumentPart, PathSeg};
 use k8s_lsp_schema::{
     fields_at, render_hover, schema_at_path, validate, FieldCandidate, SchemaRegistry, Severity,
 };
@@ -79,14 +79,29 @@ impl LanguageServer for Backend {
 
         let abs_offset = position_to_offset(&doc.text, pos.line, pos.character);
         let Some(part) = part_at(doc, abs_offset) else { return Ok(None) };
+        let part_text = &doc.text[part.byte_range.clone()];
+        let rel_offset = abs_offset.saturating_sub(part.byte_range.start);
+        let path = path_at(part_text, rel_offset);
+
+        // Value-position name-reference completion (cross-doc).
+        if line_is_value_position(&doc.text, pos.line, pos.character) {
+            if let Some(target_kind) = ref_kind_for_path(&path) {
+                let refs = snap.refs_by_kind();
+                if let Some(list) = refs.get(target_kind) {
+                    let items = name_ref_items(list, part.namespace.as_deref(), &uri);
+                    if !items.is_empty() {
+                        return Ok(Some(CompletionResponse::Array(items)));
+                    }
+                }
+            }
+            return Ok(None);
+        }
+
+        // Field-name completion from the part's schema.
         let (Some(av), Some(kind)) = (part.api_version.as_deref(), part.kind.as_deref()) else {
             return Ok(None);
         };
         let Some(schema) = self.schemas.lookup(av, kind) else { return Ok(None) };
-
-        let part_text = &doc.text[part.byte_range.clone()];
-        let rel_offset = abs_offset.saturating_sub(part.byte_range.start);
-        let path = path_at(part_text, rel_offset);
         let candidates = fields_at(&schema, &path);
         if candidates.is_empty() {
             return Ok(None);
@@ -209,6 +224,75 @@ fn field_to_item(c: FieldCandidate) -> CompletionItem {
         item.sort_text = Some(format!("1_{}", c.name));
     }
     item
+}
+
+/// True when the cursor on `line` sits after the line's first `:` separator
+/// (i.e. typing a value, not a key).
+fn line_is_value_position(text: &str, line: u32, character: u32) -> bool {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let Some(l) = lines.get(line as usize) else { return false };
+    let cut = (character as usize).min(l.len());
+    let before = &l[..cut];
+    if let Some(colon) = before.find(':') {
+        matches!(before.as_bytes().get(colon + 1), None | Some(b' ') | Some(b'\t'))
+    } else {
+        false
+    }
+}
+
+/// Map a YAML path that ends at a known cross-reference field to the Kind it
+/// points at. Returns `None` for non-reference paths.
+fn ref_kind_for_path(path: &[PathSeg]) -> Option<&'static str> {
+    let last = match path.last()? {
+        PathSeg::Key(k) => k.as_str(),
+        PathSeg::Index => return None,
+    };
+    match last {
+        "serviceAccountName" => Some("ServiceAccount"),
+        "claimName" => Some("PersistentVolumeClaim"),
+        "priorityClassName" => Some("PriorityClass"),
+        "storageClassName" => Some("StorageClass"),
+        "runtimeClassName" => Some("RuntimeClass"),
+        "secretName" => Some("Secret"),
+        "name" => {
+            let parent = path.get(path.len().checked_sub(2)?)?;
+            let PathSeg::Key(p) = parent else { return None };
+            match p.as_str() {
+                "secretRef" | "secretKeyRef" | "secret" => Some("Secret"),
+                "configMapRef" | "configMapKeyRef" | "configMap" => Some("ConfigMap"),
+                "persistentVolumeClaim" => Some("PersistentVolumeClaim"),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn name_ref_items(refs: &[ResourceRef], part_ns: Option<&str>, self_uri: &Url) -> Vec<CompletionItem> {
+    refs.iter()
+        .filter(|r| match (part_ns, r.namespace.as_deref()) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        })
+        .map(|r| {
+            let detail = match &r.namespace {
+                Some(ns) => format!("namespace: {ns}"),
+                None => "cluster-scoped or no namespace".to_string(),
+            };
+            let file = r.uri.path().rsplit('/').next().unwrap_or("");
+            let source = if r.uri == *self_uri { "this file".into() } else { file.to_string() };
+            CompletionItem {
+                label: r.name.clone(),
+                kind: Some(CompletionItemKind::REFERENCE),
+                detail: Some(detail),
+                documentation: Some(Documentation::MarkupContent(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: format!("Defined in **{source}**"),
+                })),
+                ..Default::default()
+            }
+        })
+        .collect()
 }
 
 fn byte_to_line(text: &str, byte: usize) -> u32 {

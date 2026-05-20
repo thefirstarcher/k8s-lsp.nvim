@@ -6,4 +6,4 @@
 
 pub mod snapshot;
 
-pub use snapshot::{Document, DocumentStore, Snapshot};
+pub use snapshot::{Document, DocumentStore, ResourceRef, Snapshot};
